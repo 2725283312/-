@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 代理监控面板</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #0e1116;
+        color: #e8ecf3;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      input, textarea, button {
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid #2c3444;
+        background: #151b25;
+        color: #e8ecf3;
+      }
+      textarea {
+        width: 100%;
+        min-height: 70px;
+        resize: vertical;
+      }
+      button {
+        cursor: pointer;
+      }
+      .card {
+        border: 1px solid #2c3444;
+        border-radius: 10px;
+        padding: 12px;
+        margin-bottom: 12px;
+        background: #111723;
+      }
+      .muted { color: #98a2b3; }
+      .ok { color: #6ee7b7; }
+      .bad { color: #fda4af; }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      th, td {
+        border-bottom: 1px solid #273044;
+        text-align: left;
+        padding: 6px;
+        font-size: 13px;
+      }
+      .group-title {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .panel-title {
+        margin: 0 0 8px 0;
+      }
+      .w260 { min-width: 260px; }
+      .w120 { width: 120px; }
+    </style>
+  </head>
+  <body>
+    <h2>AI API 代理监控面板</h2>
+    <div class="row">
+      <input id="token" placeholder="输入 ADMIN_TOKEN" style="min-width: 320px" />
+      <button id="saveToken">保存令牌</button>
+      <button id="refreshNow">立即刷新</button>
+      <label class="muted">自动刷新(秒):</label>
+      <input id="interval" type="number" min="2" value="5" style="width: 80px" />
+    </div>
+    <div class="row">
+      <span id="status" class="muted">未连接</span>
+      <span id="time" class="muted"></span>
+    </div>
+
+    <div class="card">
+      <h3 class="panel-title">创建分组并添加 URL</h3>
+      <div class="row">
+        <input id="createGroupName" class="w260" placeholder="分组名，例如 default" />
+        <input id="createClientKey" class="w260" placeholder="client_api_key" />
+        <input id="createUpstreamKey" class="w260" placeholder="upstream_api_key" />
+        <button id="createGroupBtn">创建分组</button>
+      </div>
+      <textarea id="createUrls" placeholder="每行一个 URL，例如：https://xxx.com 或 https://xxx.com/api"></textarea>
+      <div class="muted">提示：支持不带 /api，后端会自动补成 /api。</div>
+      <div id="createMsg" class="muted"></div>
+    </div>
+
+    <div class="card">
+      <h3 class="panel-title">给已有分组追加 URL</h3>
+      <div class="row">
+        <input id="appendGroupId" class="w120" type="number" min="1" placeholder="group_id" />
+        <button id="appendUrlBtn">追加 URL</button>
+      </div>
+      <textarea id="appendUrls" placeholder="每行一个 URL，例如：https://xxx.com 或 https://xxx.com/api"></textarea>
+      <div id="appendMsg" class="muted"></div>
+    </div>
+
+    <div id="summary" class="card muted">暂无数据</div>
+    <div id="groups"></div>
+
+    <script>
+      const FIXED_KEY = "QQliutao011007";
+      const tokenInput = document.getElementById("token");
+      const intervalInput = document.getElementById("interval");
+      const statusEl = document.getElementById("status");
+      const timeEl = document.getElementById("time");
+      const summaryEl = document.getElementById("summary");
+      const groupsEl = document.getElementById("groups");
+      const storageKey = "proxy_admin_token";
+
+      const createGroupNameInput = document.getElementById("createGroupName");
+      const createClientKeyInput = document.getElementById("createClientKey");
+      const createUpstreamKeyInput = document.getElementById("createUpstreamKey");
+      const createUrlsInput = document.getElementById("createUrls");
+      const createMsg = document.getElementById("createMsg");
+
+      const appendGroupIdInput = document.getElementById("appendGroupId");
+      const appendUrlsInput = document.getElementById("appendUrls");
+      const appendMsg = document.getElementById("appendMsg");
+
+      let timer = null;
+
+      function authHeaders() {
+        const token = tokenInput.value.trim();
+        return {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        };
+      }
+
+      function safe(v) {
+        return (v ?? "").toString().replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+      }
+
+      function parseUrlLines(text) {
+        return text
+          .split("\n")
+          .map((v) => v.trim())
+          .filter(Boolean)
+          .map((v) => v.endsWith("/") ? v.slice(0, -1) : v);
+      }
+
+      async function loadData() {
+        const token = tokenInput.value.trim();
+        if (!token) {
+          statusEl.textContent = "请先输入 ADMIN_TOKEN";
+          statusEl.className = "bad";
+          return;
+        }
+        try {
+          const groupsResp = await fetch("/admin/groups", { headers: authHeaders() });
+          if (!groupsResp.ok) {
+            throw new Error(`请求失败: ${groupsResp.status}`);
+          }
+          const groups = await groupsResp.json();
+          const detailResults = await Promise.all(
+            groups.map((g) =>
+              fetch(`/admin/groups/${g.id}`, { headers: authHeaders() }).then((r) => {
+                if (!r.ok) throw new Error(`组 ${g.id} 详情失败: ${r.status}`);
+                return r.json();
+              })
+            )
+          );
+
+          const aliveTotal = groups.reduce((n, g) => n + (g.alive_count || 0), 0);
+          const revivalTotal = groups.reduce((n, g) => n + (g.revival_count || 0), 0);
+          summaryEl.className = "card";
+          summaryEl.innerHTML =
+            `分组: <b>${groups.length}</b> ｜ 存活池URL: <b class="ok">${aliveTotal}</b> ｜ ` +
+            `复活池URL: <b class="bad">${revivalTotal}</b>`;
+
+          groupsEl.innerHTML = detailResults
+            .map((detail) => {
+              const aliveCount = detail.endpoints.filter((e) => e.pool === "alive").length;
+              const revivalCount = detail.endpoints.filter((e) => e.pool === "revival").length;
+              const rows = detail.endpoints
+                .map(
+                  (e) => `
+                    <tr>
+                      <td>${e.id}</td>
+                      <td>${safe(e.base_url)}</td>
+                      <td class="${e.pool === "alive" ? "ok" : "bad"}">${safe(e.pool)}</td>
+                      <td>${e.call_count}</td>
+                      <td>${safe(e.added_at || "-")}</td>
+                      <td>${safe(e.last_checked_at || "-")}</td>
+                      <td>${safe(e.last_error || "-")}</td>
+                    </tr>`
+                )
+                .join("");
+              return `
+                <div class="card">
+                  <div class="group-title">
+                    <b>#${detail.id} ${safe(detail.name)}</b>
+                    <span class="muted">alive: <span class="ok">${aliveCount}</span> ｜ revival: <span class="bad">${revivalCount}</span></span>
+                  </div>
+                  <div class="muted">client_api_key: ${safe(detail.client_api_key)} ｜ last_used_model: ${safe(detail.last_used_model || "-")}</div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>URL</th>
+                        <th>池</th>
+                        <th>调用次数</th>
+                        <th>添加时间</th>
+                        <th>检测时间</th>
+                        <th>最近错误</th>
+                      </tr>
+                    </thead>
+                    <tbody>${rows || '<tr><td colspan="7" class="muted">无URL</td></tr>'}</tbody>
+                  </table>
+                </div>`;
+            })
+            .join("");
+
+          statusEl.textContent = "连接正常";
+          statusEl.className = "ok";
+          timeEl.textContent = `最后刷新: ${new Date().toLocaleString()}`;
+        } catch (err) {
+          statusEl.textContent = `错误: ${err.message}`;
+          statusEl.className = "bad";
+        }
+      }
+
+      async function createGroup() {
+        createMsg.className = "muted";
+        createMsg.textContent = "提交中...";
+        try {
+          const payload = {
+            name: (createGroupNameInput.value || "default").trim(),
+            client_api_key: (createClientKeyInput.value || FIXED_KEY).trim(),
+            upstream_api_key: (createUpstreamKeyInput.value || FIXED_KEY).trim(),
+            urls: parseUrlLines(createUrlsInput.value),
+          };
+          const resp = await fetch("/admin/groups", {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            throw new Error(data.detail || JSON.stringify(data) || `status ${resp.status}`);
+          }
+          createMsg.className = "ok";
+          createMsg.textContent = `创建成功，group_id=${data.group_id}，新增URL=${data.inserted_urls}`;
+          appendGroupIdInput.value = String(data.group_id || "");
+          await loadData();
+        } catch (err) {
+          createMsg.className = "bad";
+          createMsg.textContent = `创建失败: ${err.message}`;
+        }
+      }
+
+      async function appendUrls() {
+        appendMsg.className = "muted";
+        appendMsg.textContent = "提交中...";
+        try {
+          const groupId = Number(appendGroupIdInput.value);
+          if (!groupId) {
+            throw new Error("请先输入有效 group_id");
+          }
+          const payload = { urls: parseUrlLines(appendUrlsInput.value) };
+          if (!payload.urls.length) {
+            throw new Error("请至少输入一个 URL");
+          }
+          const resp = await fetch(`/admin/groups/${groupId}/urls`, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            throw new Error(data.detail || JSON.stringify(data) || `status ${resp.status}`);
+          }
+          appendMsg.className = "ok";
+          appendMsg.textContent = `追加成功，新增URL=${data.inserted_urls}`;
+          await loadData();
+        } catch (err) {
+          appendMsg.className = "bad";
+          appendMsg.textContent = `追加失败: ${err.message}`;
+        }
+      }
+
+      function restartTimer() {
+        if (timer) clearInterval(timer);
+        const seconds = Math.max(2, Number(intervalInput.value) || 5);
+        intervalInput.value = String(seconds);
+        timer = setInterval(loadData, seconds * 1000);
+      }
+
+      document.getElementById("saveToken").addEventListener("click", () => {
+        localStorage.setItem(storageKey, tokenInput.value.trim());
+        loadData();
+      });
+      document.getElementById("refreshNow").addEventListener("click", loadData);
+      document.getElementById("createGroupBtn").addEventListener("click", createGroup);
+      document.getElementById("appendUrlBtn").addEventListener("click", appendUrls);
+      intervalInput.addEventListener("change", restartTimer);
+
+      tokenInput.value = localStorage.getItem(storageKey) || FIXED_KEY;
+      createClientKeyInput.value = FIXED_KEY;
+      createUpstreamKeyInput.value = FIXED_KEY;
+      createGroupNameInput.value = "default";
+      restartTimer();
+      loadData();
+    </script>
+  </body>
+</html>
