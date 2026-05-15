@@ -1,133 +1,167 @@
-# AI API 代理系统（OpenAI 格式）
+# AI API Proxy
 
-这是一个可部署在 Linux 服务器上的 AI API 代理服务，支持：
+基于 FastAPI + SQLite 实现的高可用 AI 接口反向代理，支持多上游端点负载均衡、自动健康检测与故障转移、流式响应透传，内置 Web 管理界面。
 
-1. 一个上游 API Key 绑定多个 URL，统一管理。  
-2. 外部以 OpenAI 兼容格式调用 `/v1/*`。  
-3. 仅从**存活池（alive）**选择 URL。  
-4. 每个 URL 默认被调用 3 次后触发标准检测（发送最简单的 AI 测试消息到 `/v1/chat/completions`，模型优先使用该分组最近一次真实调用的 model）。  
-5. 检测空回或报错时，将 URL 丢入**复活池（revival）**。  
-6. 复活池仅在 URL 添加时间满 31 天后才参与探活，探活成功后自动回到存活池。
-7. 支持后端定时读取文件中的 URL，自动加入存活池（alive）。
+---
 
-## 快速启动（Docker，推荐）
+## 功能特性
+
+- **多端点负载均衡**：请求随机分发到多个上游端点
+- **自动故障转移**：请求失败时自动切换到其他健康端点，对调用方无感知
+- **双池管理**：端点分为「存活池」与「复活池」，失效端点自动隔离，31 天后自动探活并尝试恢复
+- **健康检测**：端点达到调用阈值后自动触发健康检测，失败立即移入复活池
+- **流式响应支持**：完整支持 `stream: true` 的 SSE 流式输出，先确认首个数据块再提交端点，空流立即切换
+- **URL 文件同步**：支持从服务器本地文件批量同步 URL，读取后自动清空，方便外部脚本持续写入
+- **Web 管理界面**：内置可视化仪表盘，查看端点状态、添加 URL、触发文件同步
+- **OpenAI 格式兼容**：`/v1/...` 路由直接转发，可对接任意兼容 OpenAI 接口的客户端
+
+---
+
+## 快速开始
+
+### 使用 Docker Compose（推荐）
 
 ```bash
+cp .env.example .env
+# 编辑 .env，填写 ADMIN_TOKEN、CLIENT_API_KEY、UPSTREAM_API_KEY
 docker compose up -d --build
 ```
 
-服务端口默认 `8080`。
-内置监控前端：`http://127.0.0.1:8080/ui/`（或直接访问 `/` 自动跳转）。
+服务监听 `http://localhost:7788`，Web 管理界面：`http://localhost:7788/ui/`
+
+### 直接运行
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 7788
+```
+
+---
+
+## 环境变量
+
+| 变量名 | 默认值 | 说明 |
+|---|---|---|
+| `ADMIN_TOKEN` | `changeme` | 管理接口鉴权 Token，**必须修改** |
+| `CLIENT_API_KEY` | `changeme` | 客户端调用代理时使用的 Bearer Key，**必须修改** |
+| `UPSTREAM_API_KEY` | _(空)_ | 代理转发到上游时携带的真实 API Key，**必须填写** |
+| `DB_PATH` | `/app/data/proxy.db` | SQLite 数据库文件路径 |
+| `REQUEST_TIMEOUT` | `60` | 上游请求超时时间（秒） |
+| `HEALTH_CHECK_TIMEOUT` | `10` | 健康检测超时时间（秒） |
+| `REVIVAL_CHECK_INTERVAL` | `30` | 复活池后台轮询间隔（秒） |
+| `MAX_CALLS_BEFORE_CHECK` | `3` | 端点每调用多少次触发一次健康检测 |
+| `DEFAULT_MODEL` | `gpt-4o-mini` | 健康检测使用的模型 |
+| `URL_SYNC_FILE` | _(空)_ | 批量 URL 同步的文件路径，空则禁用 |
+| `URL_SYNC_INTERVAL` | `3600` | URL 文件同步轮询间隔（秒） |
+
+---
+
+## 使用方式
+
+### 1. 添加上游 URL
+
+通过 Web 界面（`/ui/`）直接粘贴 URL，或使用 API：
+
+```bash
+curl -X POST http://localhost:7788/admin/urls \
+  -H "Authorization: Bearer <ADMIN_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"urls": ["https://api.example.com", "https://api2.example.com"]}'
+```
+
+### 2. 通过代理调用 AI 接口
+
+将客户端的 Base URL 指向本服务，`Authorization` 填写 `CLIENT_API_KEY`：
+
+```bash
+curl http://localhost:7788/v1/chat/completions \
+  -H "Authorization: Bearer <CLIENT_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+流式调用加 `"stream": true` 即可，代理先确认有真实数据流出再向客户端提交：
+
+```bash
+curl http://localhost:7788/v1/chat/completions \
+  -H "Authorization: Bearer <CLIENT_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
+```
+
+---
+
+## 端点池工作机制
+
+```
+          请求到达
+             │
+    校验 CLIENT_API_KEY
+             │
+       从存活池随机选取端点
+             │
+    ┌────────┴────────────┐
+    │ 调用次数 < 阈值      │ 调用次数 >= 阈值
+    │                     │
+  直接转发            先发起健康检测
+    │               ┌─────┴─────┐
+    │             通过         失败
+    │               │           │
+    │           重置计数     移入复活池
+    │               │       → 重选端点
+    └───────────────┘
+         │
+    转发成功 → 调用计数 +1
+    转发失败 → 移入复活池 → 切换端点自动重试
+```
+
+**复活池**：端点进入复活池满 31 天后（以加入系统的时间为基准），后台任务定期探活。成功则重新移回存活池，并重置 31 天计时。
+
+---
 
 ## 管理接口
 
-管理接口需要 `Authorization: Bearer <ADMIN_TOKEN>`（默认 `QQliutao011007`）。
+所有管理接口需携带 `Authorization: Bearer <ADMIN_TOKEN>`。
 
-### 1) 创建分组并写入 URL
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/health` | 服务健康检查 |
+| `GET` | `/admin/urls` | 列出所有端点及状态 |
+| `POST` | `/admin/urls` | 添加 URL（`{"urls": [...]}`) |
+| `POST` | `/admin/url-sync/run` | 手动触发文件同步（可选传 `{"file": "..."}` 覆盖路径） |
 
-```bash
-curl -X POST "http://127.0.0.1:8080/admin/groups" \
-  -H "Authorization: Bearer QQliutao011007" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "default",
-    "client_api_key": "client-key-001",
-    "upstream_api_key": "sk-upstream-xxx",
-    "urls": [
-      "https://api-1.example.com",
-      "https://api-2.example.com",
-      "https://api-3.example.com"
-    ]
-  }'
+---
+
+## URL 标准化规则
+
+提交 URL 时只填域名即可：
+- 若不含路径或路径为 `/`，自动补全为 `/api`
+- 转发时构造完整路径，例如 `https://example.com/api/v1/chat/completions`
+
+---
+
+## 项目结构
+
+```
+├── app/
+│   ├── main.py          # FastAPI 应用入口，路由定义
+│   ├── pool_manager.py  # 端点池核心逻辑（选取、健康检测、故障转移）
+│   ├── config.py        # 环境变量配置加载
+│   ├── db.py            # SQLite 数据库初始化与迁移
+│   ├── schemas.py       # Pydantic 请求/响应数据模型
+│   ├── url_utils.py     # URL 标准化工具
+│   └── static/
+│       └── index.html   # Web 管理界面
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+└── requirements.txt
 ```
 
-`client_api_key` 是外部调用你代理时使用的 Key。  
-`upstream_api_key` 是代理请求上游 URL 时使用的真实 Key。
+---
 
-### 2) 给已有分组追加 URL
+## 注意事项
 
-```bash
-curl -X POST "http://127.0.0.1:8080/admin/groups/1/urls" \
-  -H "Authorization: Bearer QQliutao011007" \
-  -H "Content-Type: application/json" \
-  -d '{"urls": ["https://api-4.example.com"]}'
-```
-
-### 3) 查看池状态
-
-```bash
-curl -H "Authorization: Bearer QQliutao011007" \
-  "http://127.0.0.1:8080/admin/groups"
-```
-
-```bash
-curl -H "Authorization: Bearer QQliutao011007" \
-  "http://127.0.0.1:8080/admin/groups/1"
-```
-
-### 4) 前端实时监控
-
-打开 `/ui/` 页面，输入 `ADMIN_TOKEN` 后可实时看到：
-- 分组总览（alive/revival 总数）
-- 每组下每个 URL 的池状态、调用次数、添加时间、最近检测和错误，以及分组最近调用模型
-- 自动刷新（默认 5 秒，可调）
-- 支持页面内直接创建分组、一次性批量添加 URL、给已有分组追加 URL
-
-前端已将 `ADMIN_TOKEN`、`client_api_key`、`upstream_api_key` 默认预填为 `QQliutao011007`（可改）。
-前端 URL 支持不带 `/api`，后端会自动补成 `/api`。
-
-### 5) 文件自动导入 URL（后端定时任务）
-
-在 URL 文件中一行一个地址（支持 `#` 注释行），例如：
-
-```txt
-# url_source.txt
-https://repli--gungfipom6794.replit.app
-https://api-2.example.com/api
-```
-
-配置项：
-- `URL_SYNC_FILE`：URL 文件路径（例：`/data/url_source.txt`）
-- `URL_SYNC_GROUP_ID`：导入到哪个分组
-- `URL_SYNC_INTERVAL`：扫描间隔秒数（默认 3600，即 1 小时）
-
-逻辑：
-- 文件中的 URL 会被标准化后写入分组存活池
-- 已存在 URL 会被重新拉回 alive 池并清空错误状态
-- 每次读取并导入后，文件内容会被清空
-
-可手动触发一次文件导入：
-
-```bash
-curl -X POST "http://127.0.0.1:8080/admin/url-sync/run" \
-  -H "Authorization: Bearer QQliutao011007"
-```
-
-## 外部 OpenAI 格式调用
-
-示例：`/v1/chat/completions`
-
-```bash
-curl -X POST "http://127.0.0.1:8080/v1/chat/completions" \
-  -H "Authorization: Bearer client-key-001" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o-mini",
-    "messages": [
-      {"role": "user", "content": "hello"}
-    ]
-  }'
-```
-
-## 配置项
-
-- `ADMIN_TOKEN`：管理接口令牌。  
-- `DB_PATH`：SQLite 数据库路径。  
-- `REQUEST_TIMEOUT`：上游请求超时秒数。  
-- `HEALTH_CHECK_TIMEOUT`：标准检测超时秒数。  
-- `REVIVAL_CHECK_INTERVAL`：复活池探活间隔秒数。  
-- `URL_SYNC_INTERVAL`：URL 文件扫描间隔秒数。  
-- `URL_SYNC_FILE`：URL 文件路径（为空则关闭文件扫描导入）。  
-- `URL_SYNC_GROUP_ID`：文件导入目标分组 ID（>0 才生效）。  
-- `MAX_CALLS_BEFORE_CHECK`：单 URL 调用次数阈值（默认 3）。
-- `DEFAULT_MODEL`：无历史调用模型时，健康检测使用的兜底模型（默认 `gpt-4o-mini`）。
+- 部署前务必修改 `ADMIN_TOKEN`、`CLIENT_API_KEY`，并填写 `UPSTREAM_API_KEY`
+- Docker 部署数据库通过 `./data` 目录挂载持久化，确保该目录有写权限
+- 已有旧版数据库（含分组结构）会自动迁移，URL 数据保留，分组表删除

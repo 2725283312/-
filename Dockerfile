@@ -2,22 +2,34 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+COPY app/ ./app/
 
-ENV DB_PATH=/data/proxy.db
-ENV ADMIN_TOKEN=QQliutao011007
-ENV REQUEST_TIMEOUT=60
-ENV HEALTH_CHECK_TIMEOUT=10
-ENV REVIVAL_CHECK_INTERVAL=30
-ENV URL_SYNC_INTERVAL=3600
-ENV URL_SYNC_FILE=
-ENV URL_SYNC_GROUP_ID=0
-ENV MAX_CALLS_BEFORE_CHECK=3
-ENV DEFAULT_MODEL=gpt-4o-mini
+RUN mkdir -p /app/data
 
-EXPOSE 8080
+ENV DB_PATH=/app/data/proxy.db \
+    ADMIN_TOKEN=changeme \
+    CLIENT_API_KEY=changeme \
+    UPSTREAM_API_KEY="" \
+    REQUEST_TIMEOUT=60 \
+    HEALTH_CHECK_TIMEOUT=10 \
+    REVIVAL_CHECK_INTERVAL=30 \
+    URL_SYNC_INTERVAL=3600 \
+    URL_SYNC_FILE="" \
+    MAX_CALLS_BEFORE_CHECK=3 \
+    DEFAULT_MODEL=gpt-4o-mini
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+EXPOSE 7788
+
+CMD ["gunicorn", "app.main:app", \
+     "-k", "uvicorn.workers.UvicornWorker", \
+     "--workers", "2", \
+     "--bind", "0.0.0.0:7788", \
+     "--timeout", "120", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-"]
