@@ -9,7 +9,7 @@ def normalize_base_url(raw: str) -> str:
         return ""
     value = value.rstrip("/")
     if not (value.startswith("http://") or value.startswith("https://")):
-        return value
+        return ""
 
     parts = urlsplit(value)
     path = parts.path or ""

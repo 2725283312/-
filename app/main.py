@@ -6,18 +6,14 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, load_settings
 from app.db import get_conn, init_db
 from app.pool_manager import PoolManager
-from app.schemas import AddUrlsRequest, CreateGroupRequest, GroupDetail, GroupSummary
+from app.schemas import AddUrlsRequest, EndpointInfo, UrlSyncRunRequest
 from app.url_utils import normalize_base_url
-
-
-def normalize_url(raw: str) -> str:
-    return normalize_base_url(raw)
 
 
 def get_bearer_token(authorization: str | None) -> str | None:
@@ -26,7 +22,7 @@ def get_bearer_token(authorization: str | None) -> str | None:
     prefix = "Bearer "
     if not authorization.startswith(prefix):
         return None
-    token = authorization[len(prefix) :].strip()
+    token = authorization[len(prefix):].strip()
     return token or None
 
 
@@ -44,28 +40,22 @@ async def lifespan(app: FastAPI):
         while not stop_event.is_set():
             await manager.revive_once()
             try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=settings.revival_check_interval,
-                )
+                await asyncio.wait_for(stop_event.wait(), timeout=settings.revival_check_interval)
             except asyncio.TimeoutError:
                 pass
 
     tasks = [asyncio.create_task(revival_loop())]
 
-    if settings.url_sync_file and settings.url_sync_group_id > 0:
+    if settings.url_sync_file:
         async def url_sync_loop() -> None:
             while not stop_event.is_set():
-                manager.sync_urls_from_file(settings.url_sync_group_id, settings.url_sync_file)
+                manager.sync_urls_from_file(settings.url_sync_file)
                 try:
-                    await asyncio.wait_for(
-                        stop_event.wait(),
-                        timeout=settings.url_sync_interval,
-                    )
+                    await asyncio.wait_for(stop_event.wait(), timeout=settings.url_sync_interval)
                 except asyncio.TimeoutError:
                     pass
-
         tasks.append(asyncio.create_task(url_sync_loop()))
+
     try:
         yield
     finally:
@@ -73,7 +63,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*tasks)
 
 
-app = FastAPI(title="AI API Proxy", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="AI API Proxy", version="2.0.0", lifespan=lifespan)
 app.mount("/ui", StaticFiles(directory="app/static", html=True), name="ui")
 
 
@@ -104,157 +94,52 @@ def root() -> RedirectResponse:
     return RedirectResponse(url="/ui/")
 
 
-@app.post("/admin/groups", dependencies=[Depends(require_admin)])
-def create_group(payload: CreateGroupRequest, request: Request) -> dict[str, Any]:
-    settings = get_settings(request)
-    urls = [normalize_url(u) for u in payload.urls if normalize_url(u)]
-    with get_conn(settings.db_path) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO endpoint_groups(name, client_api_key, upstream_api_key)
-            VALUES (?, ?, ?)
-            """,
-            (payload.name, payload.client_api_key, payload.upstream_api_key),
-        )
-        group_id = int(cur.lastrowid)
-        for url in urls:
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO endpoints(group_id, base_url, pool, call_count, added_at)
-                VALUES (?, ?, 'alive', 0, CURRENT_TIMESTAMP)
-                """,
-                (group_id, url),
-            )
-            if cur.rowcount == 0:
-                conn.execute(
-                    """
-                    UPDATE endpoints
-                    SET pool = 'alive',
-                        last_error = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE group_id = ? AND base_url = ?
-                    """,
-                    (group_id, url),
-                )
-    return {"group_id": group_id, "inserted_urls": len(urls)}
-
-
-@app.post("/admin/groups/{group_id}/urls", dependencies=[Depends(require_admin)])
-def add_urls(group_id: int, payload: AddUrlsRequest, request: Request) -> dict[str, int]:
-    settings = get_settings(request)
-    urls = [normalize_url(u) for u in payload.urls if normalize_url(u)]
+@app.post("/admin/urls", dependencies=[Depends(require_admin)])
+def add_urls(payload: AddUrlsRequest, request: Request) -> dict[str, int]:
+    manager = get_pool_manager(request)
     inserted = 0
-    with get_conn(settings.db_path) as conn:
-        row = conn.execute("SELECT id FROM endpoint_groups WHERE id = ?", (group_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="group not found")
-        for url in urls:
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO endpoints(group_id, base_url, pool, call_count, added_at)
-                VALUES (?, ?, 'alive', 0, CURRENT_TIMESTAMP)
-                """,
-                (group_id, url),
-            )
-            inserted += int(cur.rowcount > 0)
-            if cur.rowcount == 0:
-                conn.execute(
-                    """
-                    UPDATE endpoints
-                    SET pool = 'alive',
-                        last_error = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE group_id = ? AND base_url = ?
-                    """,
-                    (group_id, url),
-                )
+    for url in payload.urls:
+        if manager.upsert_endpoint_alive(url):
+            inserted += 1
     return {"inserted_urls": inserted}
 
 
-@app.post("/admin/url-sync/run", dependencies=[Depends(require_admin)])
-def run_url_sync(request: Request) -> dict[str, Any]:
-    settings = get_settings(request)
-    manager = get_pool_manager(request)
-    if not settings.url_sync_file or settings.url_sync_group_id <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="url sync is disabled; set URL_SYNC_FILE and URL_SYNC_GROUP_ID",
-        )
-    inserted = manager.sync_urls_from_file(settings.url_sync_group_id, settings.url_sync_file)
-    return {
-        "inserted_urls": inserted,
-        "group_id": settings.url_sync_group_id,
-        "file": settings.url_sync_file,
-    }
-
-
-@app.get("/admin/groups", response_model=list[GroupSummary], dependencies=[Depends(require_admin)])
-def list_groups(request: Request) -> list[GroupSummary]:
+@app.get("/admin/urls", response_model=list[EndpointInfo], dependencies=[Depends(require_admin)])
+def list_urls(request: Request) -> list[EndpointInfo]:
     settings = get_settings(request)
     with get_conn(settings.db_path) as conn:
         rows = conn.execute(
             """
-            SELECT g.id, g.name,
-                   SUM(CASE WHEN e.pool = 'alive' THEN 1 ELSE 0 END) AS alive_count,
-                   SUM(CASE WHEN e.pool = 'revival' THEN 1 ELSE 0 END) AS revival_count
-            FROM endpoint_groups g
-            LEFT JOIN endpoints e ON e.group_id = g.id
-            GROUP BY g.id, g.name
-            ORDER BY g.id
+            SELECT id, base_url, pool, call_count, last_error, last_checked_at, added_at
+            FROM endpoints
+            ORDER BY pool, id
             """
         ).fetchall()
     return [
-        GroupSummary(
+        EndpointInfo(
             id=row["id"],
-            name=row["name"],
-            alive_count=int(row["alive_count"] or 0),
-            revival_count=int(row["revival_count"] or 0),
+            base_url=row["base_url"],
+            pool=row["pool"],
+            call_count=row["call_count"],
+            last_error=row["last_error"],
+            last_checked_at=row["last_checked_at"],
+            added_at=row["added_at"],
         )
         for row in rows
     ]
 
 
-@app.get("/admin/groups/{group_id}", response_model=GroupDetail, dependencies=[Depends(require_admin)])
-def get_group(group_id: int, request: Request) -> GroupDetail:
+@app.post("/admin/url-sync/run", dependencies=[Depends(require_admin)])
+def run_url_sync(request: Request, payload: UrlSyncRunRequest | None = None) -> dict[str, Any]:
     settings = get_settings(request)
-    with get_conn(settings.db_path) as conn:
-        g = conn.execute(
-            """
-            SELECT id, name, client_api_key, last_used_model
-            FROM endpoint_groups
-            WHERE id = ?
-            """,
-            (group_id,),
-        ).fetchone()
-        if not g:
-            raise HTTPException(status_code=404, detail="group not found")
-        es = conn.execute(
-            """
-            SELECT id, base_url, pool, call_count, last_error, last_checked_at, added_at
-            FROM endpoints
-            WHERE group_id = ?
-            ORDER BY id
-            """,
-            (group_id,),
-        ).fetchall()
-    return GroupDetail(
-        id=g["id"],
-        name=g["name"],
-        client_api_key=g["client_api_key"],
-        last_used_model=g["last_used_model"],
-        endpoints=[
-            {
-                "id": e["id"],
-                "base_url": e["base_url"],
-                "pool": e["pool"],
-                "call_count": e["call_count"],
-                "last_error": e["last_error"],
-                "last_checked_at": e["last_checked_at"],
-                "added_at": e["added_at"],
-            }
-            for e in es
-        ],
-    )
+    manager = get_pool_manager(request)
+
+    file_path = (payload.file.strip() if payload and payload.file and payload.file.strip() else None) or settings.url_sync_file
+    if not file_path:
+        raise HTTPException(status_code=400, detail="未指定文件路径，请在界面填写或配置 URL_SYNC_FILE 环境变量")
+
+    inserted = manager.sync_urls_from_file(file_path)
+    return {"inserted_urls": inserted, "file": file_path}
 
 
 @app.api_route("/v1/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
@@ -264,35 +149,43 @@ async def proxy_openai(
     manager: PoolManager = Depends(get_pool_manager),
     authorization: str | None = Header(default=None),
 ):
+    settings = get_settings(request)
     token = get_bearer_token(authorization)
-    if not token:
-        return JSONResponse(status_code=401, content={"error": "missing bearer token"})
+    if token != settings.client_api_key:
+        return JSONResponse(status_code=401, content={"error": "invalid api key"})
 
     body = await request.body()
-    model_hint: str | None = None
+    is_stream = False
     if body:
         try:
             parsed = json.loads(body.decode("utf-8"))
-            if isinstance(parsed, dict) and isinstance(parsed.get("model"), str):
-                model_hint = parsed["model"].strip() or None
+            if isinstance(parsed, dict) and parsed.get("stream") is True:
+                is_stream = True
         except (UnicodeDecodeError, json.JSONDecodeError):
-            model_hint = None
+            pass
 
-    header_map = {k: v for k, v in request.headers.items()}
-    query_map = {k: v for k, v in request.query_params.items()}
+    header_map = dict(request.headers)
+    query_map = dict(request.query_params)
+
+    if is_stream:
+        status_code, stream, resp_headers = await manager.proxy_with_failover_stream(
+            method=request.method,
+            path=full_path,
+            body=body,
+            headers=header_map,
+            query_params=query_map,
+        )
+        return StreamingResponse(stream, status_code=status_code, headers=resp_headers)
+
     status_code, content, upstream_headers = await manager.proxy_with_failover(
-        client_key=token,
         method=request.method,
         path=full_path,
         body=body,
         headers=header_map,
         query_params=query_map,
-        model_hint=model_hint,
     )
-    response_headers = {}
-    for k, v in upstream_headers.items():
-        lk = k.lower()
-        if lk in {"content-length", "transfer-encoding", "connection"}:
-            continue
-        response_headers[k] = v
+    response_headers = {
+        k: v for k, v in upstream_headers.items()
+        if k.lower() not in {"content-length", "transfer-encoding", "connection"}
+    }
     return Response(status_code=status_code, content=content, headers=response_headers)
